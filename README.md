@@ -3,8 +3,9 @@
 FastAPI 服务：接收 Intel HEX 文本，逐行校验（字节数 + 二补校验和），按地址组装固件映像，
 返回合并后的连续 Base64 段、段间空洞、入口地址与逐行诊断；并可针对一组命名内存区域
 做布局校验（覆盖率、data/entry 权限、区域占用率）、规划整体重定位，对比当前/目标两个
-映像规划 NOR Flash 的差分擦除/写入操作，或按 Cortex-M 向量表语义校验映像中的向量表
-（初始栈顶、复位向量、Thumb 位与 ram/executable 区域归属）。
+映像规划 NOR Flash 的差分擦除/写入操作，按 Cortex-M 向量表语义校验映像中的向量表
+（初始栈顶、复位向量、Thumb 位与 ram/executable 区域归属），或将多个带唯一名称的
+Intel HEX 映像按绝对地址叠加合并（同值归并并记录全部来源、冲突按连续段报告、入口一致性校验）。
 
 ## 快速启动（单条命令）
 
@@ -12,6 +13,8 @@ FastAPI 服务：接收 Intel HEX 文本，逐行校验（字节数 + 二补校�
 docker compose up --build
 ```
 
+服务监听容器内 **8000 端口**，compose 映射到宿主机同端口（`-p 8000:8000`，
+可用 `localhost:8000` 或 `127.0.0.1:8000` 访问；换端口只需改映射左侧）。
 启动后访问：
 
 - 接口文档（Swagger UI）：<http://localhost:8000/docs>
@@ -405,6 +408,87 @@ curl -s -X POST http://localhost:8000/api/v1/validate-vector-table \
   关联条目 `index`、相关地址 `address` 与区域 `region`（适用时）。
 - `ok` 仅在 HEX 有效、区域定义合法且无任何向量违规时为 `true`。
 
+### `POST /api/v1/merge-images`
+
+多映像叠加合并：一次提交**多个带唯一 `name` 的 Intel HEX 映像**，服务复用同一解析器
+逐源校验，再按记录 02/04 解析后的**绝对地址**叠加：
+
+- **任一源 HEX 无效即不合并**：返回各源名称与该源的**原始逐行诊断**
+  （`sources[].diagnostics`，行号/消息与 `/api/v1/assemble` 完全一致），
+  响应不含 `merged_segments`，`total_bytes` 为 0。
+- 重叠地址字节相同：正常合并，该字节的来源集合记录**全部写入它的源**；
+  字节不同：把连续冲突地址归并为**连续地址段（run）**报告，段内按源给出各自的
+  连续值块（`chunks[]`，Base64）；存在任何冲突时响应不含 `merged_segments`。
+- 入口地址：**全部缺失**，或所有非空入口值一致时才允许（没有入口的源不参与比较，
+  仅一个源给出入口时合并结果采用该入口）；非空值不一致时报告 `entry_conflict`
+  （`entries` 为给出入口的各源名→入口值）。
+- 成功时按物理连续性输出 Base64 段；当段内的来源集合发生变化（进入/离开重叠区）时
+  也会在该地址切分，因此每段的 `sources[]` 对段内每个字节都相同。
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/merge-images \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "images": [
+      {"name": "boot", "hex_text": ":020000040800F2\n:0400000000010203F6\n:00000001FF\n"},
+      {"name": "app",  "hex_text": ":020000040800F2\n:0400020002030405EC\n:00000001FF\n"}
+    ]
+  }' | jq
+```
+
+上例两源在绝对地址 `0x08000002`/`0x08000003` 以相同字节重叠，成功响应：
+
+```json
+{
+  "ok": true,
+  "sources": [
+    {"name": "boot", "ok": true, "error_count": 0, "warning_count": 0, "diagnostics": [ ... ]},
+    {"name": "app",  "ok": true, "error_count": 0, "warning_count": 0, "diagnostics": [ ... ]}
+  ],
+  "entry_address": null,
+  "total_bytes": 6,
+  "merged_segments": [
+    {"start": 134217728, "end": 134217730, "size": 2,
+     "data_base64": "AAE=", "sources": ["boot"]},
+    {"start": 134217730, "end": 134217732, "size": 2,
+     "data_base64": "AgM=", "sources": ["boot", "app"]},
+    {"start": 134217732, "end": 134217734, "size": 2,
+     "data_base64": "BAU=", "sources": ["app"]}
+  ],
+  "conflicts": [],
+  "entry_conflict": null
+}
+```
+
+字节冲突时（示意）：
+
+```json
+{
+  "ok": false,
+  "sources": [ ... ],
+  "entry_address": null,
+  "total_bytes": 3,
+  "conflicts": [
+    {
+      "start": 1, "end": 3, "size": 2,
+      "message": "conflicting byte(s) at [0x00000001, 0x00000003): 2 source chunk(s) disagree",
+      "chunks": [
+        {"source": "a", "start": 1, "end": 3, "size": 2, "data_base64": "AgM="},
+        {"source": "b", "start": 1, "end": 3, "size": 2, "data_base64": "CQg="}
+      ]
+    }
+  ],
+  "entry_conflict": null
+}
+```
+
+- `images[]` 至少 1 个且 `name` 非空、**不可重复**；重复或为空列表返回 422。
+- `sources[]` 恒按请求顺序给出每个源的 `ok`/计数/原始诊断。
+- `conflicts[]` 按地址升序；`chunks[]` 按源在请求中的顺序排列，源在该 run 中
+  不连续时会拆成多个 chunk。
+- 冲突与 `entry_conflict` 可同时出现；只要任一存在，`ok=false` 且不生成
+  `merged_segments` 字段。
+
 ## 解析规则
 
 - 每行必须形如 `:llaaaatt<data>cc`；校验 `ll`（字节数）与实际数据长度一致，
@@ -430,12 +514,14 @@ app/
   relocation.py   # 整体重定位规划（可行 delta 闭区间求交合并、选最小位移，纯逻辑）
   flash_update.py # Flash 差分烧写规划（逐块比较、擦除判定、run 合并与切分，纯逻辑）
   vector_table.py # Cortex-M 向量表校验（小端读取、栈顶/复位/Thumb 位与区域归属，纯逻辑）
+  image_merge.py  # 多映像按绝对地址叠加合并（同值归并、冲突段报告、入口一致性，纯逻辑）
 tests/
   test_hex_service.py           # 解析器与 assemble 接口
   test_validate_layout.py       # validate-layout 接口与布局逻辑
   test_plan_relocation.py       # plan-relocation 接口与重定位逻辑
   test_plan_flash_update.py     # plan-flash-update 接口与烧写规划逻辑
   test_validate_vector_table.py # validate-vector-table 接口与向量表校验逻辑
+  test_merge_images.py          # merge-images 接口与多映像合并逻辑
 Dockerfile
 docker-compose.yml
 requirements.txt       # 运行依赖

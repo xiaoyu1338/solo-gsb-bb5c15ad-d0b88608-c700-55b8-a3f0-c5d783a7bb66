@@ -6,9 +6,10 @@ import base64
 
 from fastapi import Body, FastAPI
 from fastapi.responses import RedirectResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .hex_parser import ParseResult, parse_intel_hex
+from .image_merge import MergeSource, merge_images
 from .layout import Region, validate_layout
 from .relocation import plan_relocation
 from .flash_update import plan_flash_update
@@ -465,6 +466,128 @@ class ValidateVectorTableResponse(BaseModel):
     diagnostics: list[DiagnosticOut]
 
 
+class MergeImageIn(BaseModel):
+    name: str = Field(..., min_length=1, description="Unique label identifying this source")
+    hex_text: str = Field(..., description="Intel HEX text of this source, one record per line")
+
+
+class MergeImagesRequest(BaseModel):
+    images: list[MergeImageIn] = Field(
+        ...,
+        min_length=1,
+        description="Images to overlay; every name must be unique",
+    )
+
+    @model_validator(mode="after")
+    def _require_unique_names(self) -> MergeImagesRequest:
+        seen: set[str] = set()
+        duplicates = [img.name for img in self.images if img.name in seen or seen.add(img.name)]
+        if duplicates:
+            raise ValueError(
+                "image names must be unique; duplicate name(s): "
+                + ", ".join(sorted(set(duplicates)))
+            )
+        return self
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "images": [
+                        {
+                            "name": "bootloader",
+                            "hex_text": (
+                                ":020000040800F2\n"
+                                ":10000000214601360121470136007EFE09D2190141\n"
+                                ":00000001FF\n"
+                            ),
+                        },
+                        {
+                            "name": "application",
+                            "hex_text": (
+                                ":020000040800F2\n"
+                                ":0400100001020304F0\n"
+                                ":00000001FF\n"
+                            ),
+                        },
+                    ]
+                }
+            ]
+        }
+    }
+
+
+class MergeSourceOut(BaseModel):
+    name: str = Field(..., description="Source name as given in the request")
+    ok: bool = Field(..., description="True when this source passed HEX validation")
+    error_count: int
+    warning_count: int
+    diagnostics: list[DiagnosticOut] = Field(
+        ..., description="The source's original per-line parse diagnostics"
+    )
+
+
+class MergedSegmentOut(BaseModel):
+    start: int = Field(..., description="Absolute start address")
+    end: int = Field(..., description="Exclusive end address")
+    size: int
+    data_base64: str = Field(..., description="Base64-encoded contiguous merged bytes")
+    sources: list[str] = Field(
+        ..., description="Contributing sources for every byte of this segment (request order)"
+    )
+
+
+class ConflictChunkOut(BaseModel):
+    source: str = Field(..., description="Source contributing this chunk")
+    start: int = Field(..., description="Absolute start address of the chunk")
+    end: int = Field(..., description="Exclusive end address of the chunk")
+    size: int
+    data_base64: str = Field(..., description="This source's bytes over the chunk")
+
+
+class ByteConflictOut(BaseModel):
+    start: int = Field(..., description="First conflicting address of the contiguous run")
+    end: int = Field(..., description="Exclusive end address of the run")
+    size: int = Field(..., description="Number of conflicting bytes in the run")
+    message: str
+    chunks: list[ConflictChunkOut] = Field(
+        ..., description="Per-source contiguous value chunks covering this run"
+    )
+
+
+class EntryConflictOut(BaseModel):
+    message: str
+    entries: dict[str, int] = Field(
+        ..., description="Entry address given by every source that defines one"
+    )
+
+
+class MergeImagesResponse(BaseModel):
+    ok: bool = Field(
+        ..., description="True when every source parses and no conflict prevents the merge"
+    )
+    sources: list[MergeSourceOut] = Field(
+        ..., description="Per-source parse status and original diagnostics"
+    )
+    entry_address: int | None = Field(
+        None, description="Agreed entry address; null when absent or when no merge was produced"
+    )
+    total_bytes: int = Field(
+        ..., description="Distinct addresses covered by the sources (0 when a source is invalid)"
+    )
+    merged_segments: list[MergedSegmentOut] | None = Field(
+        None,
+        description="Contiguous merged segments; omitted entirely when sources are invalid "
+        "or any conflict prevents the merge",
+    )
+    conflicts: list[ByteConflictOut] = Field(
+        ..., description="Contiguous runs of bytes whose sources disagree"
+    )
+    entry_conflict: EntryConflictOut | None = Field(
+        None, description="Set when sources define different non-null entry addresses"
+    )
+
+
 def _build_response(result: ParseResult) -> AssembleResponse:
     return AssembleResponse(
         ok=result.ok,
@@ -855,3 +978,95 @@ def validate_vector_table_route(
         violations=[VectorViolationOut(**vars(v)) for v in result.violations],
         **parse_fields,
     )
+
+
+@app.post(
+    "/api/v1/merge-images",
+    responses={200: {"model": MergeImagesResponse}},
+    tags=["merge"],
+)
+def merge_images_route(request: MergeImagesRequest) -> dict:
+    """Merge several Intel HEX images by overlaying them at absolute addresses.
+
+    Every image is parsed with the shared validator. If any source is
+    invalid, its name and original diagnostics are returned and no
+    merging happens. Otherwise the images are overlaid: identical bytes
+    at overlapping addresses merge and keep every contributing source;
+    disagreeing bytes are reported as maximal contiguous conflict runs
+    with each source's values, and differing/mixed entry addresses as an
+    ``entry_conflict``. On success (all entries absent, or the same
+    non-null entry) contiguous Base64 segments are returned, each with
+    the set of sources contributing its bytes; segments also split when
+    that source set changes.
+    """
+    parsed_sources = [
+        MergeSource(name=image.name, parsed=parse_intel_hex(image.hex_text))
+        for image in request.images
+    ]
+    source_reports = [
+        MergeSourceOut(
+            name=source.name,
+            ok=source.parsed.ok,
+            error_count=source.parsed.error_count,
+            warning_count=source.parsed.warning_count,
+            diagnostics=[DiagnosticOut(**vars(d)) for d in source.parsed.diagnostics],
+        )
+        for source in parsed_sources
+    ]
+
+    invalid = any(not source.parsed.ok for source in parsed_sources)
+    if invalid:
+        # No merge was attempted: omit merged_segments entirely.
+        return {
+            "ok": False,
+            "sources": source_reports,
+            "entry_address": None,
+            "total_bytes": 0,
+            "conflicts": [],
+            "entry_conflict": None,
+        }
+
+    result = merge_images(parsed_sources)
+    payload: dict = {
+        "ok": result.ok,
+        "sources": source_reports,
+        "entry_address": result.entry_address,
+        "total_bytes": result.total_bytes,
+        "conflicts": [
+            ByteConflictOut(
+                start=c.start,
+                end=c.end,
+                size=c.length,
+                message=c.message,
+                chunks=[
+                    ConflictChunkOut(
+                        source=chunk.source,
+                        start=chunk.start,
+                        end=chunk.end,
+                        size=len(chunk.data),
+                        data_base64=base64.b64encode(chunk.data).decode("ascii"),
+                    )
+                    for chunk in c.chunks
+                ],
+            )
+            for c in result.conflicts
+        ],
+        "entry_conflict": None
+        if result.entry_conflict is None
+        else EntryConflictOut(
+            message=result.entry_conflict.message,
+            entries=dict(result.entry_conflict.entries),
+        ),
+    }
+    if result.ok:
+        payload["merged_segments"] = [
+            MergedSegmentOut(
+                start=s.start,
+                end=s.end,
+                size=len(s.data),
+                data_base64=base64.b64encode(s.data).decode("ascii"),
+                sources=s.sources,
+            )
+            for s in result.segments
+        ]
+    return payload
