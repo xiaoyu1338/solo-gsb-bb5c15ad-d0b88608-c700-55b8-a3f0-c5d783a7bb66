@@ -3,14 +3,17 @@
 FastAPI 服务：接收 Intel HEX 文本，逐行校验（字节数 + 二补校验和），按地址组装固件映像，
 返回合并后的连续 Base64 段、段间空洞、入口地址与逐行诊断；并可针对一组命名内存区域
 做布局校验（覆盖率、data/entry 权限、区域占用率）、规划整体重定位，对比当前/目标两个
-映像规划 NOR Flash 的差分擦除/写入操作，或按 Cortex-M 向量表语义校验映像中的向量表
-（初始栈顶、复位向量、Thumb 位与 ram/executable 区域归属）。
+映像规划 NOR Flash 的差分擦除/写入操作，按 Cortex-M 向量表语义校验映像中的向量表
+（初始栈顶、复位向量、Thumb 位与 ram/executable 区域归属），或将多个命名映像按绝对
+地址归并为单个固件映像（重叠冲突与入口冲突检测、每段来源集合）。
 
 ## 快速启动（单条命令）
 
 ```bash
 docker compose up --build
 ```
+
+服务监听 **8000 端口**（宿主机与容器均为 8000，见 `docker-compose.yml` 端口映射）。
 
 启动后访问：
 
@@ -405,6 +408,63 @@ curl -s -X POST http://localhost:8000/api/v1/validate-vector-table \
   关联条目 `index`、相关地址 `address` 与区域 `region`（适用时）。
 - `ok` 仅在 HEX 有效、区域定义合法且无任何向量违规时为 `true`。
 
+### `POST /api/v1/merge-images`
+
+多映像归并：接收一组**带唯一 `name`** 的 Intel HEX 映像，复用同一解析器逐个校验，
+全部有效后按**绝对地址**归并为单个固件映像。服务端口同其他接口（默认 8000）。
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/merge-images \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "images": [
+      {"name": "boot", "hex_text": ":020000040800F2\n:10000000214601360121470136007EFE09D2190141\n:04000005080001C12D\n:00000001FF\n"},
+      {"name": "app",  "hex_text": ":020000040800F2\n:10001000202122232425262728292A2B2C2D2E2F68\n:04000005080001C12D\n:00000001FF\n"}
+    ]
+  }' | jq
+```
+
+判定规则：
+
+- `name` 必须非空且全局唯一；重名时 `duplicate_names` 列出重复名字，不解析、不归并。
+- 任一源 HEX 无效时，`invalid_sources` 给出该源的**名称与原始逐行诊断**
+  （`error_count`/`warning_count`/`diagnostics`），不归并。
+- 全部源有效后按绝对地址归并：
+  - 重叠字节**值相同** → 正常合并，该字节的全部来源都会被记录；
+  - 重叠字节**值不同** → 按**连续地址段**报告到 `conflicts`，每段给出覆盖该范围的
+    各源及其字节值（`sources[].segments`，Base64），且**不生成 `merged_segments`**。
+- 入口地址仅允许「全部缺失」或「非空值一致」（部分源缺失、其余一致亦可）；
+  否则报告 `entry_conflict`（列出各源的非空入口），同样不生成 `merged_segments`。
+- `ok` 仅在无重名、全部源有效、无字节冲突且无入口冲突时为 `true`。
+
+上例响应（两个映像相邻拼接为一段，入口一致；同样恒为 200）：
+
+```json
+{
+  "ok": true,
+  "image_count": 2,
+  "duplicate_names": [],
+  "invalid_sources": [],
+  "entry_address": 134218177,
+  "entry_conflict": null,
+  "total_bytes": 32,
+  "segment_count": 1,
+  "merged_segments": [
+    {"start": 134217728, "end": 134217760, "size": 32,
+     "data_base64": "IUYBNgEhRwE2AH7+CdIZASAhIiMkJSYnKCkqKywtLi8=",
+     "sources": ["boot", "app"]}
+  ],
+  "conflicts": []
+}
+```
+
+- `merged_segments[]`：归并后的连续 Base64 段，`sources` 为该段的来源集合
+  （按请求中映像顺序，段内任一字节来自该源即计入）。
+- `conflicts[]`：字节冲突的连续地址段（`start` 含、`end` 不含），`sources[]` 给出
+  每个覆盖源的裁剪后字节段；发生冲突时 `merged_segments` 为空、`total_bytes` 为 0。
+- `entry_address`：归并后的入口地址（全体非空入口一致时取值，全缺失为 `null`）；
+  存在 `entry_conflict` 时为 `null`。
+
 ## 解析规则
 
 - 每行必须形如 `:llaaaatt<data>cc`；校验 `ll`（字节数）与实际数据长度一致，
@@ -430,12 +490,14 @@ app/
   relocation.py   # 整体重定位规划（可行 delta 闭区间求交合并、选最小位移，纯逻辑）
   flash_update.py # Flash 差分烧写规划（逐块比较、擦除判定、run 合并与切分，纯逻辑）
   vector_table.py # Cortex-M 向量表校验（小端读取、栈顶/复位/Thumb 位与区域归属，纯逻辑）
+  merge.py        # 多映像归并（重名/无效源检测、字节与入口冲突、来源集合，纯逻辑）
 tests/
   test_hex_service.py           # 解析器与 assemble 接口
   test_validate_layout.py       # validate-layout 接口与布局逻辑
   test_plan_relocation.py       # plan-relocation 接口与重定位逻辑
   test_plan_flash_update.py     # plan-flash-update 接口与烧写规划逻辑
   test_validate_vector_table.py # validate-vector-table 接口与向量表校验逻辑
+  test_merge_images.py          # merge-images 接口与多映像归并逻辑
 Dockerfile
 docker-compose.yml
 requirements.txt       # 运行依赖

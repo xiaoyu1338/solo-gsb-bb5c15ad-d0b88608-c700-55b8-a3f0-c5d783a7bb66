@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 
 from .hex_parser import ParseResult, parse_intel_hex
 from .layout import Region, validate_layout
+from .merge import SourceImage, merge_images
 from .relocation import plan_relocation
 from .flash_update import plan_flash_update
 from .vector_table import VectorRegion, validate_vector_table
@@ -27,8 +28,10 @@ app = FastAPI(
         "occupancy and utilization), relocated as a whole by one integer "
         "delta whose feasible range is computed against those regions, "
         "diffed against another image to plan NOR-flash erase/write steps, "
-        "or read as a Cortex-M vector table checked against ram/executable "
-        "memory regions."
+        "read as a Cortex-M vector table checked against ram/executable "
+        "memory regions, or merged with other named images into a single "
+        "firmware image with per-segment source sets and byte/entry "
+        "conflict reporting."
     ),
 )
 
@@ -465,6 +468,119 @@ class ValidateVectorTableResponse(BaseModel):
     diagnostics: list[DiagnosticOut]
 
 
+class MergeImageIn(BaseModel):
+    name: str = Field(..., min_length=1, description="Unique source label")
+    hex_text: str = Field(..., description="Intel HEX text, one record per line")
+
+
+class MergeImagesRequest(BaseModel):
+    images: list[MergeImageIn] = Field(
+        ..., min_length=1, description="Named Intel HEX images; every name must be unique"
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "images": [
+                        {
+                            "name": "boot",
+                            "hex_text": (
+                                ":020000040800F2\n"
+                                ":10000000214601360121470136007EFE09D2190141\n"
+                                ":04000005080001C12D\n"
+                                ":00000001FF\n"
+                            ),
+                        },
+                        {
+                            "name": "app",
+                            "hex_text": (
+                                ":020000040800F2\n"
+                                ":10001000202122232425262728292A2B2C2D2E2F68\n"
+                                ":04000005080001C12D\n"
+                                ":00000001FF\n"
+                            ),
+                        },
+                    ]
+                }
+            ]
+        }
+    }
+
+
+class InvalidSourceOut(BaseModel):
+    name: str = Field(..., description="Name of the source whose HEX failed validation")
+    error_count: int
+    warning_count: int
+    diagnostics: list[DiagnosticOut] = Field(
+        ..., description="The source's original per-line parse diagnostics"
+    )
+
+
+class ConflictSourceOut(BaseModel):
+    name: str = Field(..., description="Source image name")
+    segments: list[SegmentOut] = Field(
+        ..., description="This source's contiguous byte runs inside the conflict range"
+    )
+
+
+class ByteConflictOut(BaseModel):
+    start: int = Field(..., description="First conflicting address")
+    end: int = Field(..., description="Exclusive end of the conflicting run")
+    size: int
+    sources: list[ConflictSourceOut] = Field(
+        ..., description="Every source defining bytes in the range, with its values"
+    )
+
+
+class SourceEntryOut(BaseModel):
+    name: str
+    entry_address: int
+
+
+class EntryConflictOut(BaseModel):
+    entries: list[SourceEntryOut] = Field(
+        ..., description="Non-null entry address of every source that defines one"
+    )
+    message: str
+
+
+class MergedSegmentOut(SegmentOut):
+    sources: list[str] = Field(
+        ..., description="Names of every source contributing at least one byte to this segment"
+    )
+
+
+class MergeImagesResponse(BaseModel):
+    ok: bool = Field(
+        ...,
+        description="True when every source is valid, names are unique and no "
+        "byte/entry conflict exists",
+    )
+    image_count: int
+    duplicate_names: list[str] = Field(
+        ..., description="Source names used more than once; non-empty aborts the merge"
+    )
+    invalid_sources: list[InvalidSourceOut] = Field(
+        ..., description="Sources whose HEX failed validation; non-empty aborts the merge"
+    )
+    entry_address: int | None = Field(
+        None, description="Agreed entry address (all non-null entries equal), if any"
+    )
+    entry_conflict: EntryConflictOut | None = Field(
+        None, description="Present when sources define differing entry addresses"
+    )
+    total_bytes: int
+    segment_count: int
+    merged_segments: list[MergedSegmentOut] = Field(
+        ..., description="Contiguous merged segments with per-segment source sets; "
+        "empty unless the merge succeeded"
+    )
+    conflicts: list[ByteConflictOut] = Field(
+        ..., description="Contiguous address ranges where sources carry differing bytes"
+    )
+
+
 def _build_response(result: ParseResult) -> AssembleResponse:
     return AssembleResponse(
         ok=result.ok,
@@ -854,4 +970,87 @@ def validate_vector_table_route(
         vectors=[VectorEntryOut(**vars(e)) for e in result.entries],
         violations=[VectorViolationOut(**vars(v)) for v in result.violations],
         **parse_fields,
+    )
+
+
+@app.post("/api/v1/merge-images", response_model=MergeImagesResponse, tags=["merge"])
+def merge_images_route(request: MergeImagesRequest) -> MergeImagesResponse:
+    """Merge several named Intel HEX images into a single firmware image.
+
+    Source names must be unique; duplicates abort the merge. Every
+    source is parsed with the shared Intel HEX validator: when any
+    source is invalid its name and original diagnostics are returned in
+    ``invalid_sources`` and no merge runs. Valid sources are combined
+    by absolute address — overlapping bytes with identical values merge
+    cleanly and every contributing source is recorded per segment,
+    while differing bytes are reported in ``conflicts`` as contiguous
+    address ranges carrying each source's values, and no
+    ``merged_segments`` are generated. Entry addresses must be absent
+    from every source or agree on one non-null value, otherwise an
+    ``entry_conflict`` is reported and the merged image is likewise
+    omitted.
+    """
+    result = merge_images(
+        [SourceImage(name=image.name, hex_text=image.hex_text) for image in request.images]
+    )
+    return MergeImagesResponse(
+        ok=result.ok,
+        image_count=result.image_count,
+        duplicate_names=result.duplicate_names,
+        invalid_sources=[
+            InvalidSourceOut(
+                name=s.name,
+                error_count=s.error_count,
+                warning_count=s.warning_count,
+                diagnostics=[DiagnosticOut(**vars(d)) for d in s.diagnostics],
+            )
+            for s in result.invalid_sources
+        ],
+        entry_address=result.entry_address,
+        entry_conflict=(
+            None
+            if result.entry_conflict is None
+            else EntryConflictOut(
+                entries=[
+                    SourceEntryOut(name=e.name, entry_address=e.entry_address)
+                    for e in result.entry_conflict.entries
+                ],
+                message=result.entry_conflict.message,
+            )
+        ),
+        total_bytes=result.total_bytes,
+        segment_count=len(result.merged_segments),
+        merged_segments=[
+            MergedSegmentOut(
+                start=s.start,
+                end=s.end,
+                size=len(s.data),
+                data_base64=base64.b64encode(s.data).decode("ascii"),
+                sources=s.sources,
+            )
+            for s in result.merged_segments
+        ],
+        conflicts=[
+            ByteConflictOut(
+                start=c.start,
+                end=c.end,
+                size=c.end - c.start,
+                sources=[
+                    ConflictSourceOut(
+                        name=cs.name,
+                        segments=[
+                            SegmentOut(
+                                start=seg.start,
+                                end=seg.end,
+                                size=len(seg.data),
+                                data_base64=base64.b64encode(seg.data).decode("ascii"),
+                            )
+                            for seg in cs.segments
+                        ],
+                    )
+                    for cs in c.sources
+                ],
+            )
+            for c in result.conflicts
+        ],
     )
